@@ -20,8 +20,8 @@ print(f"Loaded {len(pages)} pages")
 # 2. Chunk it
 print("Chunking...")
 splitter = RecursiveCharacterTextSplitter(
-    chunk_size=500,
-    chunk_overlap=50
+    chunk_size=1000,
+    chunk_overlap=100
 )
 chunks = splitter.split_documents(pages)
 print(f"Created {len(chunks)} chunks")
