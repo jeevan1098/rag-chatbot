@@ -2,12 +2,13 @@ from dotenv import load_dotenv
 import os
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_groq import ChatGroq
 from langchain_core.prompts import PromptTemplate
 from langchain_core.runnables import RunnablePassthrough
 from langchain_core.output_parsers import StrOutputParser
+import numpy as np
 
 load_dotenv()
 
@@ -33,7 +34,56 @@ embeddings = HuggingFaceEmbeddings(
 )
 vectorstore = FAISS.from_documents(chunks, embeddings)
 vectorstore.save_local("faiss_index")
-print("Vector store saved!")
+# DAY 3 EXPERIMENTS — understanding embeddings
+
+# Experiment 1: See what a vector actually looks like
+print("\n--- EXPERIMENT 1: What does an embedding look like? ---")
+sample_text = "Jeevan has experience in machine learning and deep learning"
+vector = embeddings.embed_query(sample_text)
+print(f"Text: '{sample_text}'")
+print(f"Vector length: {len(vector)} numbers")
+print(f"First 10 numbers: {[round(x, 4) for x in vector[:10]]}")
+
+# Experiment 2: Compare similar vs different texts
+print("\n--- EXPERIMENT 2: Similar vs different meaning ---")
+import numpy as np
+
+text1 = "machine learning and artificial intelligence"
+text2 = "deep learning and neural networks"
+text3 = "cooking recipes and food ingredients"
+
+vec1 = embeddings.embed_query(text1)
+vec2 = embeddings.embed_query(text2)
+vec3 = embeddings.embed_query(text3)
+
+def cosine_similarity(a, b):
+    a, b = np.array(a), np.array(b)
+    return round(float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))), 4)
+
+sim_12 = cosine_similarity(vec1, vec2)
+sim_13 = cosine_similarity(vec1, vec3)
+
+print(f"'{text1}'")
+print(f"'{text2}'")
+print(f"Similarity (ML vs DL): {sim_12}  <-- should be HIGH")
+print(f"")
+print(f"'{text1}'")
+print(f"'{text3}'")
+print(f"Similarity (ML vs cooking): {sim_13}  <-- should be LOW")
+
+# Experiment 3: See what chunks get retrieved for a question
+print("\n--- EXPERIMENT 3: What chunks does your question retrieve? ---")
+question = "What are Jeevan's technical skills?"
+
+temp_retriever = vectorstore.as_retriever(search_kwargs={"k": 5})
+retrieved_docs = temp_retriever.invoke(question)
+
+print(f"Question: '{question}'")
+print(f"Top {len(retrieved_docs)} chunks retrieved:\n")
+for i, doc in enumerate(retrieved_docs):
+    print(f"Chunk {i+1} (page {doc.metadata.get('page', '?')}):")
+    print(f"{doc.page_content[:200]}...")
+    print()
 
 # 4. Build RAG chain
 llm = ChatGroq(
