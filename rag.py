@@ -1,7 +1,6 @@
 from dotenv import load_dotenv
 import os
-import numpy as np
-from langchain_community.document_loaders import PyPDFLoader
+from langchain_community.document_loaders import PyPDFLoader, DirectoryLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
@@ -12,11 +11,15 @@ from langchain_core.output_parsers import StrOutputParser
 
 load_dotenv()
 
-# 1. Load PDF
-print("Loading PDF...")
-loader = PyPDFLoader("data/jeevan.pdf")
-pages = loader.load()
-print(f"Loaded {len(pages)} pages")
+# 1. Load ALL PDFs from data/ folder
+print("Loading all PDFs from data/ folder...")
+loader = DirectoryLoader(
+    "data/",
+    glob="**/*.pdf",
+    loader_cls=PyPDFLoader
+)
+documents = loader.load()
+print(f"Loaded {len(documents)} pages from {len(set(doc.metadata['source'] for doc in documents))} PDFs")
 
 # 2. Chunk
 print("Chunking...")
@@ -24,11 +27,11 @@ splitter = RecursiveCharacterTextSplitter(
     chunk_size=1000,
     chunk_overlap=100
 )
-chunks = splitter.split_documents(pages)
-print(f"Created {len(chunks)} chunks")
+chunks = splitter.split_documents(documents)
+print(f"Created {len(chunks)} chunks total")
 
 # 3. Embed + store
-print("Embedding...")
+print("Embedding all chunks...")
 embeddings = HuggingFaceEmbeddings(
     model_name="sentence-transformers/all-MiniLM-L6-v2"
 )
@@ -43,7 +46,7 @@ llm = ChatGroq(
     api_key=os.getenv("GROQ_API_KEY")
 )
 
-# 5. Custom prompt — forces grounded answers
+# 5. Custom prompt
 prompt = PromptTemplate.from_template("""
 You are a helpful assistant. Answer the question using ONLY the context provided below.
 
@@ -53,6 +56,7 @@ Rules:
 - Never make up information.
 - Keep answers concise and factual.
 - If asked for a list, use bullet points.
+- Always mention which document the answer came from.
 
 Context:
 {context}
@@ -65,7 +69,12 @@ Answer:""")
 retriever = vectorstore.as_retriever(search_kwargs={"k": 5})
 
 def format_docs(docs):
-    return "\n\n".join(doc.page_content for doc in docs)
+    # Include source filename in context so LLM knows which doc it came from
+    formatted = []
+    for doc in docs:
+        source = os.path.basename(doc.metadata.get('source', 'unknown'))
+        formatted.append(f"[From: {source}]\n{doc.page_content}")
+    return "\n\n".join(formatted)
 
 # 7. Chain
 chain = (
@@ -76,7 +85,9 @@ chain = (
 )
 
 # 8. Chat loop
-print("\n=== RAG Chatbot Ready! Type 'quit' to exit ===\n")
+print("\n=== Multi-PDF RAG Chatbot Ready! Type 'quit' to exit ===\n")
+print(f"Loaded PDFs: {list(set(os.path.basename(doc.metadata['source']) for doc in documents))}\n")
+
 while True:
     question = input("You: ")
     if question.lower() == "quit":
@@ -91,9 +102,9 @@ while True:
     print("\nSources:")
     for doc in docs:
         page = doc.metadata.get('page', '?')
-        source = doc.metadata.get('source', '?')
+        source = os.path.basename(doc.metadata.get('source', '?'))
         key = f"{source}-{page}"
         if key not in seen:
             seen.add(key)
-            print(f"  - Page {page} of {source}")
+            print(f"  - {source} (page {page})")
     print()
