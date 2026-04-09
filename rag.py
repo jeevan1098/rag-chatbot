@@ -5,9 +5,10 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_groq import ChatGroq
-from langchain_core.prompts import PromptTemplate
-from langchain_core.runnables import RunnablePassthrough, RunnableParallel
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.runnables import RunnablePassthrough
 from langchain_core.output_parsers import StrOutputParser
+from langchain_core.messages import HumanMessage, AIMessage
 
 load_dotenv()
 
@@ -47,9 +48,9 @@ llm = ChatGroq(
     api_key=os.getenv("GROQ_API_KEY")
 )
 
-# 5. Prompt
-prompt = PromptTemplate.from_template("""
-You are a helpful assistant. Answer the question using ONLY the context below.
+# 5. Prompt with chat history
+prompt = ChatPromptTemplate.from_messages([
+    ("system", """You are a helpful assistant. Answer questions using ONLY the context below.
 
 Rules:
 - Answer directly and precisely from the context.
@@ -57,13 +58,13 @@ Rules:
 - Never make up information.
 - Keep answers concise and factual.
 - If asked for a list, use bullet points.
+- You remember the conversation history — use it for follow-up questions.
 
 Context:
-{context}
-
-Question: {question}
-
-Answer:""")
+{context}"""),
+    MessagesPlaceholder(variable_name="chat_history"),
+    ("human", "{question}")
+])
 
 # 6. Retriever
 retriever = vectorstore.as_retriever(search_kwargs={"k": 5})
@@ -76,52 +77,64 @@ def format_docs(docs):
         formatted.append(f"[Source: {source} | Page: {page}]\n{doc.page_content}")
     return "\n\n".join(formatted)
 
-# 7. Chain that returns BOTH answer and source documents
-rag_chain_with_sources = RunnableParallel(
-    answer=( 
-        {"context": retriever | format_docs, "question": RunnablePassthrough()}
-        | prompt
-        | llm
-        | StrOutputParser()
-    ),
-    sources=retriever
-)
-
-# 8. Citation formatter
+# 7. Chain with memory
 def format_citations(source_docs):
     seen = set()
     citations = []
     for doc in source_docs:
         source = os.path.basename(doc.metadata.get('source', 'unknown'))
-        page = int(doc.metadata.get('page', 0)) + 1  # convert to human page number
+        page = int(doc.metadata.get('page', 0)) + 1
         key = f"{source}-{page}"
         if key not in seen:
             seen.add(key)
-            citations.append({
-                "file": source,
-                "page": page,
-                "preview": doc.page_content[:120].replace('\n', ' ') + "..."
-            })
+            citations.append(f"  [{len(citations)+1}] {source} — Page {page}")
     return citations
 
-# 9. Chat loop
-print(f"\n=== RAG Chatbot Ready! Loaded: {pdf_names} ===\n")
+# 8. Chat loop with memory
+print(f"\n=== RAG Chatbot with Memory Ready! ===")
+print(f"Loaded: {pdf_names}\n")
+print("Try follow-up questions like 'tell me more about that' or 'which of those is best for AI?'\n")
+
+chat_history = []  # stores conversation turns
 
 while True:
     question = input("You: ")
     if question.lower() == "quit":
         break
+    if question.lower() == "clear":
+        chat_history = []
+        print("Memory cleared!\n")
+        continue
 
-    print("\nBot:", end=" ", flush=True)
-    
-    result = rag_chain_with_sources.invoke(question)
-    answer = result["answer"]
-    citations = format_citations(result["sources"])
-    
-    print(answer)
-    
-    print("\n--- Sources & Citations ---")
-    for i, c in enumerate(citations, 1):
-        print(f"[{i}] {c['file']} — Page {c['page']}")
-        print(f"    Preview: {c['preview']}")
+    # Get relevant docs
+    docs = retriever.invoke(question)
+    context = format_docs(docs)
+
+    # Build chain
+    chain = prompt | llm | StrOutputParser()
+
+    # Run with history
+    answer = chain.invoke({
+        "context": context,
+        "chat_history": chat_history,
+        "question": question
+    })
+
+    print(f"\nBot: {answer}")
+
+    # Show citations
+    citations = format_citations(docs)
+    if citations:
+        print("\nSources:")
+        for c in citations:
+            print(c)
+
     print()
+
+    # Save to memory
+    chat_history.append(HumanMessage(content=question))
+    chat_history.append(AIMessage(content=answer))
+
+    # Keep last 6 turns (3 exchanges) to avoid context overflow
+    if len(chat_history) > 6:
+        chat_history = chat_history[-6:]
