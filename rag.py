@@ -6,12 +6,12 @@ from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_groq import ChatGroq
 from langchain_core.prompts import PromptTemplate
-from langchain_core.runnables import RunnablePassthrough
+from langchain_core.runnables import RunnablePassthrough, RunnableParallel
 from langchain_core.output_parsers import StrOutputParser
 
 load_dotenv()
 
-# 1. Load ALL PDFs from data/ folder
+# 1. Load ALL PDFs
 print("Loading all PDFs from data/ folder...")
 loader = DirectoryLoader(
     "data/",
@@ -19,7 +19,8 @@ loader = DirectoryLoader(
     loader_cls=PyPDFLoader
 )
 documents = loader.load()
-print(f"Loaded {len(documents)} pages from {len(set(doc.metadata['source'] for doc in documents))} PDFs")
+pdf_names = list(set(os.path.basename(doc.metadata['source']) for doc in documents))
+print(f"Loaded {len(documents)} pages from {len(pdf_names)} PDFs")
 
 # 2. Chunk
 print("Chunking...")
@@ -46,17 +47,16 @@ llm = ChatGroq(
     api_key=os.getenv("GROQ_API_KEY")
 )
 
-# 5. Custom prompt
+# 5. Prompt
 prompt = PromptTemplate.from_template("""
-You are a helpful assistant. Answer the question using ONLY the context provided below.
+You are a helpful assistant. Answer the question using ONLY the context below.
 
 Rules:
-- If the answer is clearly in the context, answer it directly and precisely.
-- If the answer is NOT in the context, say exactly: "I don't know based on the provided document."
+- Answer directly and precisely from the context.
+- If the answer is NOT in the context, say: "I don't know based on the provided documents."
 - Never make up information.
 - Keep answers concise and factual.
 - If asked for a list, use bullet points.
-- Always mention which document the answer came from.
 
 Context:
 {context}
@@ -69,24 +69,43 @@ Answer:""")
 retriever = vectorstore.as_retriever(search_kwargs={"k": 5})
 
 def format_docs(docs):
-    # Include source filename in context so LLM knows which doc it came from
     formatted = []
     for doc in docs:
         source = os.path.basename(doc.metadata.get('source', 'unknown'))
-        formatted.append(f"[From: {source}]\n{doc.page_content}")
+        page = doc.metadata.get('page', '?')
+        formatted.append(f"[Source: {source} | Page: {page}]\n{doc.page_content}")
     return "\n\n".join(formatted)
 
-# 7. Chain
-chain = (
-    {"context": retriever | format_docs, "question": RunnablePassthrough()}
-    | prompt
-    | llm
-    | StrOutputParser()
+# 7. Chain that returns BOTH answer and source documents
+rag_chain_with_sources = RunnableParallel(
+    answer=( 
+        {"context": retriever | format_docs, "question": RunnablePassthrough()}
+        | prompt
+        | llm
+        | StrOutputParser()
+    ),
+    sources=retriever
 )
 
-# 8. Chat loop
-print("\n=== Multi-PDF RAG Chatbot Ready! Type 'quit' to exit ===\n")
-print(f"Loaded PDFs: {list(set(os.path.basename(doc.metadata['source']) for doc in documents))}\n")
+# 8. Citation formatter
+def format_citations(source_docs):
+    seen = set()
+    citations = []
+    for doc in source_docs:
+        source = os.path.basename(doc.metadata.get('source', 'unknown'))
+        page = int(doc.metadata.get('page', 0)) + 1  # convert to human page number
+        key = f"{source}-{page}"
+        if key not in seen:
+            seen.add(key)
+            citations.append({
+                "file": source,
+                "page": page,
+                "preview": doc.page_content[:120].replace('\n', ' ') + "..."
+            })
+    return citations
+
+# 9. Chat loop
+print(f"\n=== RAG Chatbot Ready! Loaded: {pdf_names} ===\n")
 
 while True:
     question = input("You: ")
@@ -94,17 +113,15 @@ while True:
         break
 
     print("\nBot:", end=" ", flush=True)
-    answer = chain.invoke(question)
+    
+    result = rag_chain_with_sources.invoke(question)
+    answer = result["answer"]
+    citations = format_citations(result["sources"])
+    
     print(answer)
-
-    docs = retriever.invoke(question)
-    seen = set()
-    print("\nSources:")
-    for doc in docs:
-        page = doc.metadata.get('page', '?')
-        source = os.path.basename(doc.metadata.get('source', '?'))
-        key = f"{source}-{page}"
-        if key not in seen:
-            seen.add(key)
-            print(f"  - {source} (page {page})")
+    
+    print("\n--- Sources & Citations ---")
+    for i, c in enumerate(citations, 1):
+        print(f"[{i}] {c['file']} — Page {c['page']}")
+        print(f"    Preview: {c['preview']}")
     print()
