@@ -3,7 +3,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import uvicorn
 import os
-import shutil
 
 from dotenv import load_dotenv
 from langchain_community.document_loaders import PyPDFLoader
@@ -31,6 +30,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ── Constants ──────────────────────────────────────
+MAX_FILE_SIZE_MB = 10
+UPLOAD_DIR = "data/uploads"
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+
 # ── Global state ───────────────────────────────────
 embeddings = HuggingFaceEmbeddings(
     model_name="sentence-transformers/all-MiniLM-L6-v2"
@@ -44,8 +48,6 @@ llm = ChatGroq(
 vectorstore = None
 chat_history = []
 uploaded_files = []
-
-os.makedirs("data/uploads", exist_ok=True)
 
 # ── Prompt ─────────────────────────────────────────
 prompt = ChatPromptTemplate.from_messages([
@@ -64,6 +66,14 @@ Context:
 ])
 
 # ── Helper functions ───────────────────────────────
+def validate_pdf(filename: str) -> None:
+    ext = os.path.splitext(filename)[1].lower()
+    if ext != ".pdf":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid file type '{ext}'. Only PDF files accepted."
+        )
+
 def format_docs(docs):
     formatted = []
     for doc in docs:
@@ -88,18 +98,27 @@ def index_pdf(filepath):
     global vectorstore
     loader = PyPDFLoader(filepath)
     pages = loader.load()
+
+    if len(pages) == 0:
+        raise HTTPException(
+            status_code=400,
+            detail="PDF appears to be empty or unreadable."
+        )
+
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=1000,
         chunk_overlap=100
     )
     chunks = splitter.split_documents(pages)
+
     if vectorstore is None:
         vectorstore = FAISS.from_documents(chunks, embeddings)
     else:
         new_vs = FAISS.from_documents(chunks, embeddings)
         vectorstore.merge_from(new_vs)
+
     vectorstore.save_local("faiss_index")
-    return len(chunks)
+    return len(pages), len(chunks)
 
 # ── Request models ─────────────────────────────────
 class ChatRequest(BaseModel):
@@ -110,7 +129,6 @@ class ClearRequest(BaseModel):
     session_id: str = "default"
 
 # ── Endpoints ──────────────────────────────────────
-
 @app.get("/")
 def root():
     return {"message": "RAG Chatbot API is running!"}
@@ -120,25 +138,58 @@ def health():
     return {
         "status": "ok",
         "vectorstore_ready": vectorstore is not None,
-        "uploaded_files": uploaded_files
+        "uploaded_files": uploaded_files,
+        "total_files": len(uploaded_files)
     }
 
 @app.post("/upload")
 async def upload_pdf(file: UploadFile = File(...)):
-    if not file.filename.endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="Only PDF files accepted")
+    # 1. Validate file type
+    validate_pdf(file.filename)
 
-    filepath = f"data/uploads/{file.filename}"
+    # 2. Check for duplicates
+    if file.filename in uploaded_files:
+        raise HTTPException(
+            status_code=400,
+            detail=f"'{file.filename}' is already uploaded. Delete it first."
+        )
+
+    # 3. Read and check size
+    contents = await file.read()
+    size_mb = len(contents) / (1024 * 1024)
+    if size_mb > MAX_FILE_SIZE_MB:
+        raise HTTPException(
+            status_code=400,
+            detail=f"File too large ({size_mb:.1f}MB). Max allowed is {MAX_FILE_SIZE_MB}MB."
+        )
+
+    # 4. Save to disk
+    filepath = f"{UPLOAD_DIR}/{file.filename}"
     with open(filepath, "wb") as f:
-        shutil.copyfileobj(file.file, f)
+        f.write(contents)
 
-    chunks_created = index_pdf(filepath)
+    # 5. Index the PDF
+    try:
+        pages_count, chunks_count = index_pdf(filepath)
+    except HTTPException:
+        os.remove(filepath)
+        raise
+    except Exception as e:
+        os.remove(filepath)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to process PDF: {str(e)}"
+        )
+
     uploaded_files.append(file.filename)
 
     return {
-        "message": f"{file.filename} uploaded and indexed successfully",
-        "chunks_created": chunks_created,
-        "total_files": len(uploaded_files)
+        "message": f"'{file.filename}' uploaded and indexed successfully",
+        "file_size_mb": round(size_mb, 2),
+        "pages_indexed": pages_count,
+        "chunks_created": chunks_count,
+        "total_files_loaded": len(uploaded_files),
+        "all_files": uploaded_files
     }
 
 @app.post("/chat")
@@ -187,6 +238,19 @@ def list_files():
         "uploaded_files": uploaded_files,
         "total": len(uploaded_files)
     }
+
+@app.delete("/files/{filename}")
+def delete_file(filename: str):
+    if filename not in uploaded_files:
+        raise HTTPException(
+            status_code=404,
+            detail=f"'{filename}' not found."
+        )
+    filepath = f"{UPLOAD_DIR}/{filename}"
+    if os.path.exists(filepath):
+        os.remove(filepath)
+    uploaded_files.remove(filename)
+    return {"message": f"'{filename}' deleted successfully"}
 
 # ── Run ────────────────────────────────────────────
 if __name__ == "__main__":
